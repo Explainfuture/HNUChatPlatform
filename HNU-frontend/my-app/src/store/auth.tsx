@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import axios from 'axios'
 import type { ApiResponse } from '../api/client'
-import type { UserInfo } from '../api/types'
+import type { LoginResponse } from '../api/types'
 
 export type AuthUser = {
   userId: number
@@ -18,32 +18,62 @@ type AuthState = {
   clearAuth: () => void
 }
 
-const TOKEN_KEY = 'hnu_token'
 const USER_KEY = 'hnu_user'
+const CLIENT_INSTANCE_KEY = 'hnu_client_instance_id'
+const CLIENT_INSTANCE_HEADER = 'X-Client-Instance-Id'
 const BASE_URL = 'http://localhost:8080'
 
+let accessToken: string | null = null
+
 const AuthContext = createContext<AuthState | undefined>(undefined)
+
+function getSessionStorage() {
+  if (typeof window === 'undefined') {
+    return null
+  }
+  return window.sessionStorage
+}
 
 function notifyAuthUpdated() {
   window.dispatchEvent(new Event('auth:updated'))
 }
 
+function generateClientInstanceId() {
+  if (typeof window !== 'undefined' && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID()
+  }
+  return `tab_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+export function getClientInstanceId() {
+  const storage = getSessionStorage()
+  if (!storage) {
+    return 'server-render'
+  }
+  let clientInstanceId = storage.getItem(CLIENT_INSTANCE_KEY)
+  if (!clientInstanceId) {
+    clientInstanceId = generateClientInstanceId()
+    storage.setItem(CLIENT_INSTANCE_KEY, clientInstanceId)
+  }
+  return clientInstanceId
+}
+
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY)
+  return accessToken
 }
 
 export function setToken(token: string) {
-  localStorage.setItem(TOKEN_KEY, token)
+  accessToken = token
   notifyAuthUpdated()
 }
 
 export function clearToken() {
-  localStorage.removeItem(TOKEN_KEY)
+  accessToken = null
   notifyAuthUpdated()
 }
 
 export function getStoredUser(): AuthUser | null {
-  const raw = localStorage.getItem(USER_KEY)
+  const raw = getSessionStorage()?.getItem(USER_KEY)
   if (!raw) return null
   try {
     return JSON.parse(raw) as AuthUser
@@ -53,23 +83,43 @@ export function getStoredUser(): AuthUser | null {
 }
 
 export function setStoredUser(user: AuthUser) {
-  localStorage.setItem(USER_KEY, JSON.stringify(user))
+  getSessionStorage()?.setItem(USER_KEY, JSON.stringify(user))
   notifyAuthUpdated()
 }
 
 export function clearStoredUser() {
-  localStorage.removeItem(USER_KEY)
+  getSessionStorage()?.removeItem(USER_KEY)
   notifyAuthUpdated()
 }
 
-function mapUserInfo(data: UserInfo): AuthUser {
+function mapLoginUser(data: LoginResponse): AuthUser {
   return {
-    userId:
-      (data as unknown as { id?: number }).id ??
-      (data as unknown as { userId?: number }).userId ??
-      0,
+    userId: data.userId,
     nickname: data.nickname,
     role: data.role,
+  }
+}
+
+async function restoreSession(): Promise<LoginResponse | null> {
+  try {
+    const res = await axios.post<ApiResponse<LoginResponse>>(
+      `${BASE_URL}/api/v1/auth/refresh`,
+      null,
+      {
+        withCredentials: true,
+        headers: {
+          [CLIENT_INSTANCE_HEADER]: getClientInstanceId(),
+        },
+      },
+    )
+    const payload = res.data as ApiResponse<LoginResponse> | LoginResponse
+    const data = 'data' in payload ? payload.data : payload
+    if (!data?.token) {
+      return null
+    }
+    return data
+  } catch {
+    return null
   }
 }
 
@@ -82,39 +132,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let canceled = false
 
     const bootstrap = async () => {
-      const storedToken = getToken()
-      if (!storedToken) {
-        if (!canceled) {
-          setUserState(null)
-          setLoading(false)
-        }
-        return
-      }
-      try {
-        const res = await axios.get<ApiResponse<UserInfo>>(`${BASE_URL}/api/v1/users/me`, {
-          headers: {
-            Authorization: `Bearer ${storedToken}`,
-          },
-          withCredentials: true,
-        })
-        const payload = res.data as ApiResponse<UserInfo> | UserInfo
-        const data = 'data' in payload ? payload.data : payload
-        if (data && !canceled) {
-          const nextUser = mapUserInfo(data)
-          setStoredUser(nextUser)
-          setUserState(nextUser)
-        }
-      } catch {
+      const restored = await restoreSession()
+      if (!restored) {
         clearToken()
         clearStoredUser()
         if (!canceled) {
           setTokenState(null)
           setUserState(null)
-        }
-      } finally {
-        if (!canceled) {
           setLoading(false)
         }
+        return
+      }
+
+      const nextUser = mapLoginUser(restored)
+      setToken(restored.token)
+      setStoredUser(nextUser)
+
+      if (!canceled) {
+        setTokenState(restored.token)
+        setUserState(nextUser)
+        setLoading(false)
       }
     }
 
@@ -125,13 +162,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    const syncFromStorage = () => {
+    const syncFromState = () => {
       setTokenState(getToken())
       setUserState(getStoredUser())
     }
-    window.addEventListener('auth:updated', syncFromStorage)
+    window.addEventListener('auth:updated', syncFromState)
     return () => {
-      window.removeEventListener('auth:updated', syncFromStorage)
+      window.removeEventListener('auth:updated', syncFromState)
     }
   }, [])
 

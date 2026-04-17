@@ -67,9 +67,11 @@ logging:
     console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{50} - %msg%n"
 
 jwt:
-  secret: "change-this-to-a-long-random-secret-key"
+  secret: ${JWT_SECRET:change-this-to-a-long-random-secret-key}
   access-expire-seconds: 1800
   refresh-expire-seconds: 2592000
+  session-idle-expire-seconds: 2592000
   role-cache-seconds: 1800
+  refresh-cookie-secure: false
   issuer: "hnu-campus"
 

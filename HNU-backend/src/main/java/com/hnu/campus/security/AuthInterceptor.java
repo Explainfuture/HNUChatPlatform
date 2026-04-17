@@ -2,6 +2,7 @@ package com.hnu.campus.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hnu.campus.dto.common.ApiResponse;
+import com.hnu.campus.entity.AuthSession;
 import com.hnu.campus.entity.User;
 import com.hnu.campus.mapper.UserMapper;
 import io.jsonwebtoken.Claims;
@@ -24,9 +25,9 @@ public class AuthInterceptor implements HandlerInterceptor {
     private static final String AUTH_HEADER = "Authorization";
     private static final String BEARER_PREFIX = "Bearer ";
     private static final String ROLE_CACHE_PREFIX = "user_role:";
-    private static final String TOKEN_VERSION_PREFIX = "user_token_version:";
 
     private final JwtUtil jwtUtil;
+    private final AuthSessionSupport authSessionSupport;
     private final StringRedisTemplate redisTemplate;
     private final UserMapper userMapper;
 
@@ -45,8 +46,12 @@ public class AuthInterceptor implements HandlerInterceptor {
             new PublicEndpoint(HttpMethod.GET, "/swagger-ui/**")
     );
 
-    public AuthInterceptor(JwtUtil jwtUtil, StringRedisTemplate redisTemplate, UserMapper userMapper) {
+    public AuthInterceptor(JwtUtil jwtUtil,
+                           AuthSessionSupport authSessionSupport,
+                           StringRedisTemplate redisTemplate,
+                           UserMapper userMapper) {
         this.jwtUtil = jwtUtil;
+        this.authSessionSupport = authSessionSupport;
         this.redisTemplate = redisTemplate;
         this.userMapper = userMapper;
     }
@@ -74,8 +79,14 @@ public class AuthInterceptor implements HandlerInterceptor {
         try {
             Claims claims = jwtUtil.parseToken(token);
             Long userId = jwtUtil.getUserId(claims);
-            Long tokenVersion = jwtUtil.getTokenVersion(claims);
-            if (!isTokenVersionValid(userId, tokenVersion)) {
+            Long authVersion = jwtUtil.getAuthVersion(claims);
+            String sessionId = jwtUtil.getSessionId(claims);
+            if (!authSessionSupport.isAuthVersionValid(userId, authVersion)) {
+                writeUnauthorized(response, "Invalid auth token");
+                return false;
+            }
+            AuthSession session = authSessionSupport.findSession(sessionId);
+            if (session == null || !authSessionSupport.isSessionActive(session) || !userId.equals(session.getUserId())) {
                 writeUnauthorized(response, "Invalid auth token");
                 return false;
             }
@@ -118,24 +129,6 @@ public class AuthInterceptor implements HandlerInterceptor {
             redisTemplate.opsForValue().set(key, role, Duration.ofSeconds(roleCacheSeconds));
         }
         return role;
-    }
-
-    private boolean isTokenVersionValid(Long userId, Long tokenVersion) {
-        if (userId == null || tokenVersion == null) {
-            return false;
-        }
-        String key = TOKEN_VERSION_PREFIX + userId;
-        String current = redisTemplate.opsForValue().get(key);
-        if (current == null) {
-            redisTemplate.opsForValue().set(key, String.valueOf(tokenVersion));
-            return true;
-        }
-        try {
-            return Long.valueOf(current).equals(tokenVersion);
-        } catch (NumberFormatException ex) {
-            redisTemplate.opsForValue().set(key, String.valueOf(tokenVersion));
-            return true;
-        }
     }
 
     private void writeUnauthorized(HttpServletResponse response, String message) throws IOException {

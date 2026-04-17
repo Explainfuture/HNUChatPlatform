@@ -4,6 +4,8 @@ import com.hnu.campus.dto.auth.LoginDTO;
 import com.hnu.campus.dto.auth.LoginResponseDTO;
 import com.hnu.campus.dto.auth.RegisterDTO;
 import com.hnu.campus.dto.common.ApiResponse;
+import com.hnu.campus.exception.BusinessException;
+import jakarta.servlet.http.HttpServletRequest;
 import com.hnu.campus.service.AuthService;
 import jakarta.servlet.http.HttpServletResponse;
 import io.swagger.v3.oas.annotations.Operation;
@@ -23,10 +25,16 @@ import java.time.Duration;
 @RequestMapping("/api/v1/auth")
 @Tag(name = "Auth", description = "Register/login/refresh/verify-code endpoints")
 public class AuthController {
+    private static final String REFRESH_COOKIE_NAME = "hnu_refresh_token";
+    private static final String CLIENT_INSTANCE_HEADER = "X-Client-Instance-Id";
+
     private final AuthService authService;
 
     @Value("${jwt.refresh-expire-seconds:2592000}")
     private long refreshExpireSeconds;
+
+    @Value("${jwt.refresh-cookie-secure:false}")
+    private boolean refreshCookieSecure;
 
     public AuthController(AuthService authService) {
         this.authService = authService;
@@ -41,8 +49,15 @@ public class AuthController {
 
     @PostMapping("/login")
     @Operation(summary = "Login", description = "Login and return access token")
-    public ApiResponse<LoginResponseDTO> login(@Valid @RequestBody LoginDTO loginDTO, HttpServletResponse response) {
-        LoginResponseDTO loginResponse = authService.login(loginDTO);
+    public ApiResponse<LoginResponseDTO> login(@Valid @RequestBody LoginDTO loginDTO,
+                                               HttpServletRequest request,
+                                               HttpServletResponse response) {
+        LoginResponseDTO loginResponse = authService.login(
+                loginDTO,
+                extractClientInstanceId(request),
+                extractClientIp(request),
+                request.getHeader(HttpHeaders.USER_AGENT)
+        );
         writeRefreshCookie(response, loginResponse.getRefreshToken());
         loginResponse.setRefreshToken(null);
         return ApiResponse.success(loginResponse);
@@ -51,9 +66,15 @@ public class AuthController {
     @PostMapping("/refresh")
     @Operation(summary = "Refresh token", description = "Refresh access token by refresh token")
     public ApiResponse<LoginResponseDTO> refresh(
-            @CookieValue(value = "hnu_refresh_token", required = false) String refreshToken,
+            @CookieValue(value = REFRESH_COOKIE_NAME, required = false) String refreshToken,
+            HttpServletRequest request,
             HttpServletResponse response) {
-        LoginResponseDTO refreshResponse = authService.refresh(refreshToken);
+        LoginResponseDTO refreshResponse = authService.refresh(
+                refreshToken,
+                extractClientInstanceId(request),
+                extractClientIp(request),
+                request.getHeader(HttpHeaders.USER_AGENT)
+        );
         writeRefreshCookie(response, refreshResponse.getRefreshToken());
         refreshResponse.setRefreshToken(null);
         return ApiResponse.success(refreshResponse);
@@ -62,10 +83,13 @@ public class AuthController {
     @PostMapping("/logout")
     @Operation(summary = "Logout", description = "Clear refresh token and logout")
     public ApiResponse<Void> logout(
-            @CookieValue(value = "hnu_refresh_token", required = false) String refreshToken,
+            @CookieValue(value = REFRESH_COOKIE_NAME, required = false) String refreshToken,
+            HttpServletRequest request,
             HttpServletResponse response) {
-        authService.logout(refreshToken);
-        clearRefreshCookie(response);
+        boolean shouldClearCookie = authService.logout(refreshToken, extractClientInstanceId(request));
+        if (shouldClearCookie) {
+            clearRefreshCookie(response);
+        }
         return ApiResponse.success("Logout success");
     }
 
@@ -80,8 +104,9 @@ public class AuthController {
         if (refreshToken == null || refreshToken.isBlank()) {
             return;
         }
-        ResponseCookie cookie = ResponseCookie.from("hnu_refresh_token", refreshToken)
+        ResponseCookie cookie = ResponseCookie.from(REFRESH_COOKIE_NAME, refreshToken)
                 .httpOnly(true)
+                .secure(refreshCookieSecure)
                 .path("/")
                 .maxAge(Duration.ofSeconds(refreshExpireSeconds))
                 .sameSite("Lax")
@@ -90,12 +115,29 @@ public class AuthController {
     }
 
     private void clearRefreshCookie(HttpServletResponse response) {
-        ResponseCookie cookie = ResponseCookie.from("hnu_refresh_token", "")
+        ResponseCookie cookie = ResponseCookie.from(REFRESH_COOKIE_NAME, "")
                 .httpOnly(true)
+                .secure(refreshCookieSecure)
                 .path("/")
                 .maxAge(Duration.ZERO)
                 .sameSite("Lax")
                 .build();
         response.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+    }
+
+    private String extractClientInstanceId(HttpServletRequest request) {
+        String clientInstanceId = request.getHeader(CLIENT_INSTANCE_HEADER);
+        if (clientInstanceId == null || clientInstanceId.isBlank()) {
+            throw new BusinessException(400, "Missing client instance id");
+        }
+        return clientInstanceId.trim();
+    }
+
+    private String extractClientIp(HttpServletRequest request) {
+        String forwardedFor = request.getHeader("X-Forwarded-For");
+        if (forwardedFor != null && !forwardedFor.isBlank()) {
+            return forwardedFor.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
     }
 }

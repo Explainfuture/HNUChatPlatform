@@ -16,8 +16,6 @@ import { useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { ApiResponse } from '../api/client'
 import type { CommentItem, PostDetail } from '../api/types'
-import mockPosts from '../mock/posts.json'
-import mockComments from '../mock/comments.json'
 import { useAuth } from '../store/auth'
 
 export default function PostDetailPage() {

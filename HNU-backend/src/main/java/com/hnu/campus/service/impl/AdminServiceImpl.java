@@ -12,36 +12,30 @@ import com.hnu.campus.enums.UserRole;
 import com.hnu.campus.exception.BusinessException;
 import com.hnu.campus.mapper.PostMapper;
 import com.hnu.campus.mapper.UserMapper;
+import com.hnu.campus.security.AuthSessionSupport;
 import com.hnu.campus.security.CurrentUserContext;
 import com.hnu.campus.service.AdminService;
 import com.hnu.campus.service.CommentService;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Set;
 
 @Service
 public class AdminServiceImpl implements AdminService {
-    private static final String TOKEN_VERSION_PREFIX = "user_token_version:";
-    private static final String REFRESH_TOKEN_PREFIX = "refresh_token:";
-    private static final String REFRESH_SET_PREFIX = "refresh_set:";
-    private static final String ROLE_CACHE_PREFIX = "user_role:";
-
     private final UserMapper userMapper;
     private final PostMapper postMapper;
     private final CommentService commentService;
-    private final StringRedisTemplate redisTemplate;
+    private final AuthSessionSupport authSessionSupport;
 
     public AdminServiceImpl(UserMapper userMapper,
                             PostMapper postMapper,
                             CommentService commentService,
-                            StringRedisTemplate redisTemplate) {
+                            AuthSessionSupport authSessionSupport) {
         this.userMapper = userMapper;
         this.postMapper = postMapper;
         this.commentService = commentService;
-        this.redisTemplate = redisTemplate;
+        this.authSessionSupport = authSessionSupport;
     }
 
     @Override
@@ -165,17 +159,6 @@ public class AdminServiceImpl implements AdminService {
     }
 
     private void revokeUserSessions(Long userId) {
-        String versionKey = TOKEN_VERSION_PREFIX + userId;
-        redisTemplate.opsForValue().increment(versionKey);
-        redisTemplate.delete(ROLE_CACHE_PREFIX + userId);
-
-        String setKey = REFRESH_SET_PREFIX + userId;
-        Set<String> tokens = redisTemplate.opsForSet().members(setKey);
-        if (tokens != null) {
-            for (String token : tokens) {
-                redisTemplate.delete(REFRESH_TOKEN_PREFIX + token);
-            }
-        }
-        redisTemplate.delete(setKey);
+        authSessionSupport.revokeAllUserSessions(userId, "admin_kick");
     }
 }

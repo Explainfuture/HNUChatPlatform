@@ -4,52 +4,44 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.hnu.campus.dto.auth.LoginDTO;
 import com.hnu.campus.dto.auth.LoginResponseDTO;
 import com.hnu.campus.dto.auth.RegisterDTO;
+import com.hnu.campus.entity.AuthRefreshToken;
+import com.hnu.campus.entity.AuthSession;
 import com.hnu.campus.entity.User;
+import com.hnu.campus.entity.UserSecurityState;
 import com.hnu.campus.enums.AuthStatus;
 import com.hnu.campus.enums.UserRole;
 import com.hnu.campus.exception.BusinessException;
 import com.hnu.campus.mapper.UserMapper;
-import com.hnu.campus.security.JwtUtil;
+import com.hnu.campus.security.AuthSessionSupport;
 import com.hnu.campus.service.AuthService;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 @Slf4j
 @Service
 public class AuthServiceImpl implements AuthService {
     private static final String VERIFY_CODE_PREFIX = "verify_code:";
-    private static final String REFRESH_TOKEN_PREFIX = "refresh_token:";
-    private static final String ROLE_CACHE_PREFIX = "user_role:";
-    private static final String TOKEN_VERSION_PREFIX = "user_token_version:";
-    private static final String REFRESH_SET_PREFIX = "refresh_set:";
 
     private final UserMapper userMapper;
     private final StringRedisTemplate redisTemplate;
     private final BCryptPasswordEncoder passwordEncoder;
-    private final JwtUtil jwtUtil;
-
-    @Value("${jwt.refresh-expire-seconds:2592000}")
-    private long refreshExpireSeconds;
-
-    @Value("${jwt.role-cache-seconds:1800}")
-    private long roleCacheSeconds;
+    private final AuthSessionSupport authSessionSupport;
 
     public AuthServiceImpl(UserMapper userMapper,
                            StringRedisTemplate redisTemplate,
                            BCryptPasswordEncoder passwordEncoder,
-                           JwtUtil jwtUtil) {
+                           AuthSessionSupport authSessionSupport) {
         this.userMapper = userMapper;
         this.redisTemplate = redisTemplate;
         this.passwordEncoder = passwordEncoder;
-        this.jwtUtil = jwtUtil;
+        this.authSessionSupport = authSessionSupport;
     }
 
     @Override
@@ -84,7 +76,8 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    public LoginResponseDTO login(LoginDTO loginDTO) {
+    @Transactional
+    public LoginResponseDTO login(LoginDTO loginDTO, String clientInstanceId, String ip, String userAgent) {
         String phone = loginDTO.getPhone();
         String key = VERIFY_CODE_PREFIX + phone;
         String cachedCode = redisTemplate.opsForValue().get(key);
@@ -103,16 +96,15 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(403, "Account not approved");
         }
 
-        Long tokenVersion = getOrInitTokenVersion(user.getId());
-        String accessToken = jwtUtil.generateToken(user.getId(), user.getRole(), tokenVersion);
-        String refreshToken = generateRefreshToken();
-        storeRefreshToken(refreshToken, user.getId(), tokenVersion);
-        cacheUserRole(user.getId(), user.getRole());
+        UserSecurityState securityState = authSessionSupport.getOrCreateSecurityState(user.getId());
+        AuthSession session = authSessionSupport.createSession(user.getId(), clientInstanceId, ip, userAgent);
+        AuthSessionSupport.IssuedRefreshToken refreshToken = authSessionSupport.issueRefreshToken(session.getId(), null);
+        String accessToken = authSessionSupport.createAccessToken(user, securityState, session.getId());
 
         LoginResponseDTO response = new LoginResponseDTO();
         response.setToken(accessToken);
-        response.setRefreshToken(refreshToken);
-        response.setExpiresIn(jwtUtil.getAccessExpireSeconds());
+        response.setRefreshToken(refreshToken.rawToken());
+        response.setExpiresIn(authSessionSupport.getAccessExpireSeconds());
         response.setUserId(user.getId());
         response.setNickname(user.getNickname());
         response.setRole(user.getRole());
@@ -121,29 +113,35 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    public LoginResponseDTO refresh(String refreshToken) {
+    @Transactional
+    public LoginResponseDTO refresh(String refreshToken, String clientInstanceId, String ip, String userAgent) {
         if (refreshToken == null || refreshToken.isBlank()) {
             throw new BusinessException(401, "Missing refresh token");
         }
-        String key = REFRESH_TOKEN_PREFIX + refreshToken;
-        String tokenValue = redisTemplate.opsForValue().get(key);
-        if (tokenValue == null) {
+
+        AuthRefreshToken persistedToken = authSessionSupport.findRefreshToken(refreshToken);
+        if (persistedToken == null) {
             throw new BusinessException(401, "Login expired, please re-login");
         }
-        Long userId;
-        Long tokenVersionFromRefresh;
-        String[] parts = tokenValue.split(":");
-        if (parts.length != 2) {
+        AuthSession session = authSessionSupport.findSession(persistedToken.getSessionId());
+        if (authSessionSupport.isRefreshTokenReplay(persistedToken)) {
+            authSessionSupport.flagRefreshTokenReuse(persistedToken.getId());
+            if (session != null) {
+                authSessionSupport.revokeSession(session.getId(), "refresh_token_reuse");
+            }
+            throw new BusinessException(401, "Refresh token reuse detected, please re-login");
+        }
+        if (!authSessionSupport.isRefreshTokenUsable(persistedToken) || session == null || !authSessionSupport.isSessionActive(session)) {
+            if (session != null) {
+                authSessionSupport.revokeSession(session.getId(), "refresh_token_invalid");
+            }
             throw new BusinessException(401, "Login expired, please re-login");
         }
-        try {
-            userId = Long.valueOf(parts[0]);
-            tokenVersionFromRefresh = Long.valueOf(parts[1]);
-        } catch (NumberFormatException ex) {
-            throw new BusinessException(401, "Login expired, please re-login");
+        if (!authSessionSupport.sessionMatchesClient(session, clientInstanceId)) {
+            throw new BusinessException(401, "Session is bound to another tab");
         }
 
-        User user = userMapper.selectById(userId);
+        User user = userMapper.selectById(session.getUserId());
         if (user == null) {
             throw new BusinessException(401, "User not found");
         }
@@ -151,22 +149,18 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(403, "Account not approved");
         }
 
-        Long tokenVersion = getOrInitTokenVersion(userId);
-        if (!tokenVersion.equals(tokenVersionFromRefresh)) {
-            throw new BusinessException(401, "Login expired, please re-login");
-        }
-
-        String accessToken = jwtUtil.generateToken(userId, user.getRole(), tokenVersion);
-        String newRefreshToken = generateRefreshToken();
-        deleteRefreshToken(userId, refreshToken);
-        storeRefreshToken(newRefreshToken, userId, tokenVersion);
-        cacheUserRole(userId, user.getRole());
+        UserSecurityState securityState = authSessionSupport.getOrCreateSecurityState(user.getId());
+        authSessionSupport.consumeRefreshToken(persistedToken.getId());
+        authSessionSupport.touchSession(session.getId(), ip, userAgent);
+        AuthSessionSupport.IssuedRefreshToken nextRefreshToken =
+                authSessionSupport.issueRefreshToken(session.getId(), persistedToken.getId());
+        String accessToken = authSessionSupport.createAccessToken(user, securityState, session.getId());
 
         LoginResponseDTO response = new LoginResponseDTO();
         response.setToken(accessToken);
-        response.setRefreshToken(newRefreshToken);
-        response.setExpiresIn(jwtUtil.getAccessExpireSeconds());
-        response.setUserId(userId);
+        response.setRefreshToken(nextRefreshToken.rawToken());
+        response.setExpiresIn(authSessionSupport.getAccessExpireSeconds());
+        response.setUserId(user.getId());
         response.setNickname(user.getNickname());
         response.setRole(user.getRole());
         return response;
@@ -181,68 +175,20 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    public void logout(String refreshToken) {
+    @Transactional
+    public boolean logout(String refreshToken, String clientInstanceId) {
         if (refreshToken == null || refreshToken.isBlank()) {
-            return;
+            return false;
         }
-        String key = REFRESH_TOKEN_PREFIX + refreshToken;
-        String tokenValue = redisTemplate.opsForValue().get(key);
-        if (tokenValue == null) {
-            return;
+        AuthRefreshToken persistedToken = authSessionSupport.findRefreshToken(refreshToken);
+        if (persistedToken == null) {
+            return false;
         }
-        String[] parts = tokenValue.split(":");
-        if (parts.length != 2) {
-            return;
+        AuthSession session = authSessionSupport.findSession(persistedToken.getSessionId());
+        if (session == null || !authSessionSupport.sessionMatchesClient(session, clientInstanceId)) {
+            return false;
         }
-        Long userId;
-        try {
-            userId = Long.valueOf(parts[0]);
-        } catch (NumberFormatException ex) {
-            return;
-        }
-        deleteRefreshToken(userId, refreshToken);
-    }
-
-    private void storeRefreshToken(String refreshToken, Long userId, Long tokenVersion) {
-        String key = REFRESH_TOKEN_PREFIX + refreshToken;
-        String value = userId + ":" + tokenVersion;
-        redisTemplate.opsForValue().set(key, value, Duration.ofSeconds(refreshExpireSeconds));
-        String setKey = REFRESH_SET_PREFIX + userId;
-        redisTemplate.opsForSet().add(setKey, refreshToken);
-        redisTemplate.expire(setKey, Duration.ofSeconds(refreshExpireSeconds));
-    }
-
-    private void deleteRefreshToken(Long userId, String refreshToken) {
-        String key = REFRESH_TOKEN_PREFIX + refreshToken;
-        redisTemplate.delete(key);
-        String setKey = REFRESH_SET_PREFIX + userId;
-        redisTemplate.opsForSet().remove(setKey, refreshToken);
-    }
-
-    private void cacheUserRole(Long userId, String role) {
-        if (role == null) {
-            return;
-        }
-        String key = ROLE_CACHE_PREFIX + userId;
-        redisTemplate.opsForValue().set(key, role, Duration.ofSeconds(roleCacheSeconds));
-    }
-
-    private Long getOrInitTokenVersion(Long userId) {
-        String key = TOKEN_VERSION_PREFIX + userId;
-        String current = redisTemplate.opsForValue().get(key);
-        if (current == null) {
-            redisTemplate.opsForValue().set(key, "1");
-            return 1L;
-        }
-        try {
-            return Long.valueOf(current);
-        } catch (NumberFormatException ex) {
-            redisTemplate.opsForValue().set(key, "1");
-            return 1L;
-        }
-    }
-
-    private String generateRefreshToken() {
-        return UUID.randomUUID().toString().replace("-", "");
+        authSessionSupport.revokeSession(session.getId(), "logout");
+        return true;
     }
 }

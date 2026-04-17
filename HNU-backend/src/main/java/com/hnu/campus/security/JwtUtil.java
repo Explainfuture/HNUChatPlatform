@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.UUID;
 
 @Component
 public class JwtUtil {
@@ -24,16 +25,18 @@ public class JwtUtil {
         this.issuer = issuer;
     }
 
-    public String generateToken(Long userId, String role, Long tokenVersion) {
+    public String generateToken(Long userId, String role, Long authVersion, String sessionId) {
         Date now = new Date();
         Date expireAt = new Date(now.getTime() + accessExpireSeconds * 1000);
         return Jwts.builder()
+                .id(UUID.randomUUID().toString())
                 .subject(String.valueOf(userId))
                 .issuer(issuer)
                 .issuedAt(now)
                 .expiration(expireAt)
                 .claim("role", role)
-                .claim("ver", tokenVersion)
+                .claim("ver", authVersion)
+                .claim("sid", sessionId)
                 .signWith(secretKey)
                 .compact();
     }
@@ -55,7 +58,7 @@ public class JwtUtil {
         return role == null ? null : role.toString();
     }
 
-    public Long getTokenVersion(Claims claims) {
+    public Long getAuthVersion(Claims claims) {
         Object version = claims.get("ver");
         if (version == null) {
             return null;
@@ -68,6 +71,11 @@ public class JwtUtil {
         } catch (NumberFormatException ex) {
             return null;
         }
+    }
+
+    public String getSessionId(Claims claims) {
+        Object sessionId = claims.get("sid");
+        return sessionId == null ? null : sessionId.toString();
     }
 
     public long getAccessExpireSeconds() {

@@ -7,11 +7,11 @@ import com.hnu.campus.dto.auth.RegisterDTO;
 public interface AuthService {
     Long register(RegisterDTO registerDTO);
 
-    LoginResponseDTO login(LoginDTO loginDTO);
+    LoginResponseDTO login(LoginDTO loginDTO, String clientInstanceId, String ip, String userAgent);
 
-    LoginResponseDTO refresh(String refreshToken);
+    LoginResponseDTO refresh(String refreshToken, String clientInstanceId, String ip, String userAgent);
 
-    void logout(String refreshToken);
+    boolean logout(String refreshToken, String clientInstanceId);
 
     void sendVerifyCode(String phone);
 }

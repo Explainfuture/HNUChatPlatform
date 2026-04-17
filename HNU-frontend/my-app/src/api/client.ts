@@ -1,7 +1,14 @@
 import axios from 'axios'
-import type { AxiosRequestConfig } from 'axios'
+import type { AxiosRequestConfig, InternalAxiosRequestConfig } from 'axios'
 import type { LoginResponse } from './types'
-import { clearStoredUser, clearToken, getToken, setStoredUser, setToken } from '../store/auth'
+import {
+  clearStoredUser,
+  clearToken,
+  getClientInstanceId,
+  getToken,
+  setStoredUser,
+  setToken,
+} from '../store/auth'
 
 export type ApiResponse<T> = {
   code: number
@@ -23,11 +30,22 @@ const rawApi = axios.create({
 
 let refreshPromise: Promise<LoginResponse | null> | null = null
 
+function applyClientBinding(config: InternalAxiosRequestConfig) {
+  config.headers['X-Client-Instance-Id'] = getClientInstanceId()
+  return config
+}
+
 api.interceptors.request.use((config) => {
+  applyClientBinding(config)
   const token = getToken()
   if (token) {
     config.headers.Authorization = `Bearer ${token}`
   }
+  return config
+})
+
+rawApi.interceptors.request.use((config) => {
+  applyClientBinding(config)
   return config
 })
 
